@@ -1,0 +1,101 @@
+"""Evaluate UltraOCR:  python scripts/eval.py --config ocr"""
+
+import argparse
+import torch
+from torch.utils.data import DataLoader
+
+from ultraocr.config import Config
+from ultraocr.model import OCR
+from ultraocr.dataset import OCRDataset, collate_fn
+from ultraocr.utils import (
+    ctc_decode,
+    generate_simple_synthetic,
+    levenshtein_distance,
+    _init_from_config,
+)
+
+
+def main(config_name, checkpoint_path=None, num_samples=10):
+    cfg = Config(f"config/{config_name}.yaml")
+    _init_from_config(cfg)
+
+    checkpoint_path = checkpoint_path or cfg.checkpoint.best_path
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Config: {config_name}  |  Device: {device}  |  Checkpoint: {checkpoint_path}")
+
+    # --- Model (architecture is defined in model.py, not in config) ---
+    model = OCR(num_of_chars=cfg.num_chars).to(device)
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state"])
+    model.eval()
+    print("Checkpoint loaded.\n")
+
+    # --- Synthetic samples ---
+    print("--- Synthetic Samples ---")
+    for _ in range(num_samples):
+        img, gt = generate_simple_synthetic(cfg)
+        x = torch.tensor(img).float().unsqueeze(0).to(device)
+        with torch.no_grad():
+            logits = model(x)[0]
+        pred = ctc_decode(logits, cfg.idx_to_char)
+        print(f"  GT: {gt:12s}  PRED: {pred}")
+
+    # --- Validation set ---
+    print("\n--- Validation Set ---")
+    val_dataset = OCRDataset(cfg.dataset.val_json, shuffle=False, num_samples=cfg.dataset.get("num_samples"))
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.dataset.batch_size,
+        shuffle=False,
+        num_workers=cfg.dataset.num_workers,
+        collate_fn=collate_fn,
+        prefetch_factor=cfg.dataset.prefetch_factor,
+        persistent_workers=True,
+    )
+
+    total_edit_distance = 0
+    total_gt_chars = 0
+
+    with torch.no_grad():
+        for val_images, _, _, val_texts in val_loader:
+            val_images = val_images.to(device)
+            val_logits = model(val_images)
+
+            for idx in range(val_images.size(0)):
+                pred_text = ctc_decode(val_logits[idx], cfg.idx_to_char)
+                gt_text = val_texts[idx]
+                total_edit_distance += levenshtein_distance(pred_text, gt_text)
+                total_gt_chars += max(len(gt_text), 1)
+
+    char_accuracy = (1.0 - (total_edit_distance / total_gt_chars)) * 100
+    print(f"Character Accuracy: {char_accuracy:.2f}%")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Evaluate UltraOCR model",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="ocr",
+        help="Config name (without .yaml extension, looked up in config/ dir)",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Checkpoint path (default: uses best_path from config)",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=10,
+        help="Number of synthetic samples to show",
+    )
+    args = parser.parse_args()
+
+    main(args.config, args.checkpoint, args.num_samples)
