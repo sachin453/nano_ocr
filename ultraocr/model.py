@@ -5,48 +5,32 @@ from torch import nn
 
 
 class OCR(nn.Module):
-    """CTC-based OCR model."""
-
-    def __init__(
-        self,
-        num_of_chars,
-        conv_channels=(4, 8, 16, 32),
-        kernel_size=3,
-        gru_hidden=128,
-        gru_num_layers=2,
-        gru_bidirectional=True,
-    ):
+    def __init__(self,num_of_chars):  
         super().__init__()
 
-        # Build CNN backbone
-        in_ch = 3
-        layers = []
-        for out_ch in conv_channels:
-            layers.append(
-                nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=1, padding="same")
-            )
-            layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
-            layers.append(nn.ReLU())
-            in_ch = out_ch
-
-        self.backbone = nn.Sequential(*layers)
-
-        gru_input_size = conv_channels[-1]
-        gru_dirs = 2 if gru_bidirectional else 1
-
-        self.biGRUs = nn.GRU(
-            input_size=gru_input_size,
-            hidden_size=gru_hidden,
-            num_layers=gru_num_layers,
-            batch_first=True,
-            bidirectional=gru_bidirectional,
+        self.img_w = 512
+        self.img_h = 64
+        self.backbone = nn.Sequential(
+            nn.Conv2d(in_channels=3,out_channels=4,kernel_size=3,stride=1,padding='same'),
+            nn.BatchNorm2d(num_features=4),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2,stride=2),
+            nn.Conv2d(in_channels=4,out_channels=16,kernel_size=3,stride=1,padding='same'),
+            nn.BatchNorm2d(num_features=16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2,stride=2),
+            nn.Conv2d(in_channels=16,out_channels=64,kernel_size=3,stride=1,padding='same'),
+            nn.BatchNorm2d(num_features=64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2,stride=2),
         )
 
-        self.decoder = nn.Linear(gru_hidden * gru_dirs, num_of_chars + 1, bias=True)
+        self.biGRUs = nn.GRU(input_size=64,hidden_size=128,num_layers=2,batch_first=True,bidirectional=True)
+        self.decoder = nn.Linear(256, num_of_chars + 1, bias=True)
 
     def forward(self, x):
-        x = self.backbone(x)
-        x = x.mean(dim=-2, keepdim=False)
+        x = self.backbone(x) ### out = N x 64 x 8 x 64
+        x = x.mean(dim=-2, keepdim=False) ### out = N x 64 x 64
         x = x.permute(0, 2, 1)
         x = self.biGRUs(x)
         x = self.decoder(x[0])

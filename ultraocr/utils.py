@@ -112,8 +112,8 @@ def generate_simple_synthetic(cfg=None):
 
 def ctc_decode(logits, idx_to_char_map=None):
     """CTC greedy decoder. Uses global idx_to_char by default."""
-    mapping = idx_to_char_map if idx_to_char_map is not None else idx_to_char
-    if not mapping:
+    _map = idx_to_char_map if idx_to_char_map is not None else globals().get("idx_to_char", {})
+    if not _map:
         return ""
     pred = logits.argmax(-1)
     text = []
@@ -121,8 +121,8 @@ def ctc_decode(logits, idx_to_char_map=None):
     for p in pred:
         p = p.item()
         if p != prev and p != 0:
-            if p in mapping:
-                text.append(mapping[p])
+            if p in _map:
+                text.append(_map[p])
         prev = p
     return "".join(text)
 

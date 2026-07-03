@@ -2,28 +2,19 @@
 
 import json
 import random
+import warnings
 import numpy as np
 import cv2
 import torch
 from torch.utils.data import Dataset
 
-from .utils import _init_from_config, char_to_idx, IMG_H, IMG_W
+from ultraocr import utils as _U
+
+IMG_H = 64
+IMG_W = 512
 
 
 class OCRDataset(Dataset):
-    """Reads images from disk as specified by a JSON file.
-
-    JSON format:
-        [{"path": "data/synthetic/images/000000.png", "label": "123"}, ...]
-
-    Args:
-        json_path: Path to the labels JSON file.
-        shuffle: If True, shuffle data on init (for training).
-        num_samples: If None, use all data. If <= available, randomly sample
-                     without replacement. If > available, randomly oversample
-                     with replacement.
-    """
-
     def __init__(self, json_path, shuffle=False, num_samples=None):
         with open(json_path, "r") as f:
             all_data = json.load(f)
@@ -68,11 +59,22 @@ def collate_fn(batch):
     images, texts = zip(*batch)
     images = torch.stack(images)
 
+    if not _U.char_to_idx:
+        warnings.warn(
+            "char_to_idx is empty — labels will be dropped. "
+            "Ensure _init_from_config(cfg) is called before DataLoader iteration."
+        )
+
     targets = []
     target_lengths = []
 
     for text in texts:
-        encoded = [char_to_idx[c] for c in text if c in char_to_idx]
+        encoded = [_U.char_to_idx[c] for c in text if c in _U.char_to_idx]
+        if not encoded:
+            warnings.warn(
+                f"All characters in label '{text}' were dropped. "
+                "Check that the config charset matches the dataset labels."
+            )
         targets.extend(encoded)
         target_lengths.append(len(encoded))
 

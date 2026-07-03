@@ -12,7 +12,7 @@ dataset:
   data_json: "data/synthetic/labels.json"
   val_json: "data/synthetic/labels.json"
   num_samples: null
-  batch_size: 512
+  batch_size: 256
   num_workers: 12
   prefetch_factor: 2
   # Synthetic generation params (used by generate_synthetic.py)
@@ -24,13 +24,13 @@ dataset:
 
 training:
   lr: 0.001
-  epochs: 100
+  epochs: 20
   grad_clip_norm: 5.0
   early_stop_patience: 50
 
 loss:
   focal_alpha: 1.0
-  focal_gamma: 2.0
+  focal_gamma: 1.0
   blank_idx: 0
 
 checkpoint:
