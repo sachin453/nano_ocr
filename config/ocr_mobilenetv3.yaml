@@ -1,0 +1,38 @@
+# UltraOCR — timm pretrained backbone + BiGRU + CTC
+model:
+  timm_name: "mobilenetv3_small_100.lamb_in1k"   # any timm model name
+  num_blocks: 4                                   # keep only first N InvertedResidual blocks (1-6)
+  pretrained: true                                # download ImageNet weights
+  gru_hidden_size: 128                            # lighter GRU
+  gru_num_layers: 1                               # single layer GRU
+  multi_scale: true                               # fuse features from multiple backbone blocks
+  fusion_channels: 48                             # output channels after multi-scale fusion
+  img_h: 32
+  img_w: 256
+
+charset: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ .,!?:;'\"()[]{}+-=/%*$€£¥₹@#&_|/\\<>~^"
+blank_token: 0
+
+dataset:
+  json_path: "data/synthetic/labels.json"
+  num_samples: 100000
+  train_split: 0.9
+  batch_size: 512
+  num_workers: 10
+  shuffle: true
+  synthetic:
+    text_length: [2, 15]       # min/max characters per sample
+    font_size: [20, 48]        # min/max font size
+    pad: [2, 8]                # min/max padding around text
+    jitter: [0, 15]            # max horizontal jitter
+
+training:
+  lr: 0.001
+  weight_decay: 0.00001
+  epochs: 20
+  early_stopping_patience: 5
+
+checkpoint:
+  dir: "artifacts"
+  latest_name: "aocr_latest.pt"
+  best_name: "aocr_best.pt"

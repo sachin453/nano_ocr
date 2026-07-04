@@ -1,71 +1,62 @@
-"""Configuration loader for UltraOCR.
-
-Each model experiment has its own standalone YAML config file in config/.
-Usage:
-    cfg = Config("config/ocr.yaml")
-    print(cfg.model.conv_channels)
-"""
+"""YAML-based configuration loader for UltraOCR."""
 
 import os
-import copy
 import yaml
 
 
 class Config:
-    """Loads a single YAML config file and provides attribute-style access."""
+    """Loads a YAML config file and exposes sections via attribute access."""
 
-    def __init__(self, path):
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        full_path = os.path.join(base_dir, path)
+    def __init__(self, config_path: str):
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file not found: {config_path}")
 
-        with open(full_path, "r") as f:
-            data = yaml.safe_load(f)
+        with open(config_path, "r") as f:
+            self._raw = yaml.safe_load(f)
 
-        # Build char mappings from the literal charset string
-        chars = data.get("charset", "")
-        data["char_to_idx"] = {c: i + 1 for i, c in enumerate(chars)}
-        data["idx_to_char"] = {i + 1: c for i, c in enumerate(chars)}
-        data["num_chars"] = len(chars)
+        # --- Charset ---
+        self.charset = self._raw.get("charset", "")
+        self.blank_token = self._raw.get("blank_token", 0)
+        self.num_chars = len(self.charset)
 
-        self._data = data
+        # Build mapping dicts
+        self.char_to_idx = {c: i + 1 for i, c in enumerate(self.charset)}
+        self.idx_to_char = {i + 1: c for i, c in enumerate(self.charset)}
 
-        # Expose top-level keys and nested dicts as attributes
-        _plain = {"char_to_idx", "idx_to_char"}
-        for key, value in data.items():
-            if isinstance(value, dict) and key not in _plain:
-                setattr(self, key, _AttrDict(value))
-            else:
-                setattr(self, key, value)
+        # --- Model ---
+        self.model = _DotDict(self._raw.get("model", {}))
 
-    def to_dict(self):
-        return copy.deepcopy(self._data)
+        # --- Dataset ---
+        self.dataset = _DotDict(self._raw.get("dataset", {}))
 
-    def __repr__(self):
-        return f"Config({self._data})"
+        # --- Training ---
+        self.training = _DotDict(self._raw.get("training", {}))
+
+        # --- Checkpoint ---
+        self.checkpoint = _DotDict(self._raw.get("checkpoint", {}))
+
+    @property
+    def best_path(self):
+        return os.path.join(self.checkpoint.dir, self.checkpoint.best_name)
+
+    @property
+    def latest_path(self):
+        return os.path.join(self.checkpoint.dir, self.checkpoint.latest_name)
 
 
-class _AttrDict:
-    """Dict wrapper with attribute access for string keys."""
+class _DotDict:
+    """Thin wrapper that exposes dict keys as attributes (recursive, read-only)."""
 
-    def __init__(self, data):
-        self._data = data
+    def __init__(self, data: dict):
         for key, value in data.items():
             if isinstance(value, dict):
-                nested = _AttrDict(value)
-                self._data[key] = nested
-                if isinstance(key, str) and key.isidentifier():
-                    setattr(self, key, nested)
-            elif isinstance(key, str) and key.isidentifier():
-                setattr(self, key, value)
+                value = _DotDict(value)
+            elif isinstance(value, list):
+                value = tuple(value)  # YAML lists → tuples (e.g. out_indices)
+            setattr(self, key, value)
 
     def get(self, key, default=None):
-        return self._data.get(key, default)
-
-    def __contains__(self, key):
-        return key in self._data
+        return getattr(self, key, default)
 
     def __repr__(self):
-        return repr(self._data)
-
-    def to_dict(self):
-        return copy.deepcopy(self._data)
+        return repr(self.__dict__)

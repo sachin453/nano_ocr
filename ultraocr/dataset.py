@@ -8,10 +8,10 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
-from ultraocr import utils as _U
 
-IMG_H = 64
-IMG_W = 512
+IMG_H = 32
+IMG_W = 256
+
 
 
 class OCRDataset(Dataset):
@@ -54,31 +54,3 @@ class OCRDataset(Dataset):
         return np.transpose(canvas, (2, 0, 1))
 
 
-def collate_fn(batch):
-    """Collate function that encodes text labels and returns padded targets."""
-    images, texts = zip(*batch)
-    images = torch.stack(images)
-
-    if not _U.char_to_idx:
-        warnings.warn(
-            "char_to_idx is empty — labels will be dropped. "
-            "Ensure _init_from_config(cfg) is called before DataLoader iteration."
-        )
-
-    targets = []
-    target_lengths = []
-
-    for text in texts:
-        encoded = [_U.char_to_idx[c] for c in text if c in _U.char_to_idx]
-        if not encoded:
-            warnings.warn(
-                f"All characters in label '{text}' were dropped. "
-                "Check that the config charset matches the dataset labels."
-            )
-        targets.extend(encoded)
-        target_lengths.append(len(encoded))
-
-    targets = torch.tensor(targets, dtype=torch.long)
-    target_lengths = torch.tensor(target_lengths, dtype=torch.long)
-
-    return images, targets, target_lengths, texts

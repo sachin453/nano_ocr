@@ -1,143 +1,164 @@
-"""Utility functions for synthetic data generation, CTC decoding, and evaluation."""
+"""Shared utilities: CTC decoding, Levenshtein distance, collation, synthetic data helpers."""
 
 import random
 from pathlib import Path
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+
+import torch
 
 
-# ----- Backward-compatible module-level globals (populated when config is loaded) -----
-CHARS = "0123456789"
-IMG_W = 512
-IMG_H = 64
-char_to_idx = {}
-idx_to_char = {}
-BLANK_IDX = 0
+# --- Image constants (used by synthetic generation) ---
+IMG_H = 32
+IMG_W = 256
+
+# --- Font paths (auto-discovered) ---
 FONT_PATHS = []
 
 
 def _init_from_config(cfg):
-    """Initialize module-level globals from a Config object.
+    """Set module-level globals from a Config object."""
+    global IMG_H, IMG_W, FONT_PATHS
 
-    Called automatically by Config-aware code paths but kept available
-    so that existing scripts that import the globals directly still work.
-    """
-    global CHARS, IMG_W, IMG_H, char_to_idx, idx_to_char, BLANK_IDX, FONT_PATHS
+    if hasattr(cfg, "model"):
+        IMG_H = getattr(cfg.model, "img_h", IMG_H)
+        IMG_W = getattr(cfg.model, "img_w", IMG_W)
 
-    CHARS = cfg.charset
-    IMG_W = cfg.image.width
-    IMG_H = cfg.image.height
-    char_to_idx = cfg.char_to_idx
-    idx_to_char = cfg.idx_to_char
-    BLANK_IDX = cfg.loss.blank_idx
-
-    # Build font paths recursively from configured font directories
-    font_dirs = cfg.image.font_dirs
-    FONT_PATHS = []
-    for d in font_dirs:
-        for ext in ("*.ttf", "*.otf", "*.TTF", "*.OTF"):
-            FONT_PATHS.extend(str(p) for p in Path(d).rglob(ext))
-
-
-def get_random_colors():
-    """Generates contrasting random colors for background and text."""
-    bg = (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
-    if sum(bg) > 382:
-        txt = (random.randint(0, 100), random.randint(0, 100), random.randint(0, 100))
-    else:
-        txt = (random.randint(150, 255), random.randint(150, 255), random.randint(150, 255))
-    return bg, txt
-
-
-def generate_simple_synthetic(cfg=None):
-    """Generates tightly cropped text scaled to IMG_H, simulating a detector pipeline.
-
-    Args:
-        cfg: Optional Config object. If None, uses module-level globals (must be initialized).
-    """
-    if cfg is not None:
-        _init_from_config(cfg)
-        synth_cfg = cfg.dataset.synthetic
-    else:
-        synth_cfg = None
-
-    # Fallback: scan common font dirs recursively
+    # Discover fonts if not already loaded
     if not FONT_PATHS:
-        for d in ("data/fonts_simple", "data/fonts_heavy"):
+        for d in ("data/fonts_simple", "data/fonts_heavy", "data/fonts"):
             for ext in ("*.ttf", "*.otf", "*.TTF", "*.OTF"):
                 FONT_PATHS.extend(str(p) for p in Path(d).rglob(ext))
 
-    # Use config values or fall back to globals
-    tl_min, tl_max = (synth_cfg.text_length[0], synth_cfg.text_length[1]) if synth_cfg else (3, 12)
-    fs_min, fs_max = (synth_cfg.font_size[0], synth_cfg.font_size[1]) if synth_cfg else (32, 48)
-    pad_min, pad_max = (synth_cfg.pad[0], synth_cfg.pad[1]) if synth_cfg else (0, 3)
-    jit_max_val = synth_cfg.jitter[1] if synth_cfg else 10
 
-    length = random.randint(tl_min, tl_max)
-    text = "".join(random.choice(CHARS) for _ in range(length))
-    bg_color, txt_color = get_random_colors()
+def get_random_colors():
+    """Return (bg_color, text_color) as RGB tuples.
 
-    font_path = random.choice(FONT_PATHS)
-    font_size = random.randint(fs_min, fs_max)
-    font = ImageFont.truetype(font_path, font_size)
+    Generates UI-like color schemes: dark theme, light theme, or colored.
+    Ensures sufficient contrast between background and text.
+    """
+    scheme = random.random()
 
-    dummy_img = Image.new("RGB", (1, 1))
-    dummy_draw = ImageDraw.Draw(dummy_img)
-    bbox = dummy_draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
+    if scheme < 0.35:
+        # Dark theme (dark bg, light text)
+        bg = (
+            random.randint(15, 50),
+            random.randint(15, 50),
+            random.randint(15, 60),
+        )
+        txt = (
+            random.randint(200, 255),
+            random.randint(200, 255),
+            random.randint(200, 255),
+        )
+    elif scheme < 0.70:
+        # Light theme (light bg, dark text)
+        bg = (
+            random.randint(200, 255),
+            random.randint(200, 255),
+            random.randint(200, 255),
+        )
+        txt = (
+            random.randint(15, 80),
+            random.randint(15, 80),
+            random.randint(15, 80),
+        )
+    else:
+        # Colored theme (colored bg, contrasting text)
+        bg = (
+            random.randint(40, 200),
+            random.randint(40, 200),
+            random.randint(40, 200),
+        )
+        # Pick text color with good contrast
+        brightness = sum(bg) / 3
+        if brightness > 128:
+            txt = (random.randint(0, 60),) * 3
+        else:
+            txt = (random.randint(180, 255),) * 3
 
-    pad_x = random.randint(pad_min, pad_max)
-    pad_y = random.randint(pad_min, pad_max)
-    crop_w = max(1, tw + (pad_x * 2))
-    crop_h = max(1, th + (pad_y * 2))
-
-    tight_img = Image.new("RGB", (crop_w, crop_h), color=bg_color)
-    draw = ImageDraw.Draw(tight_img)
-    draw.text((pad_x - bbox[0], pad_y - bbox[1]), text, font=font, fill=txt_color)
-
-    scale = IMG_H / crop_h
-    new_w = min(int(crop_w * scale), IMG_W)
-    resized_img = tight_img.resize((new_w, IMG_H), Image.Resampling.BILINEAR)
-
-    final_img = Image.new("RGB", (IMG_W, IMG_H), color=bg_color)
-    max_jitter = max(0, IMG_W - new_w)
-    x_off = random.randint(0, min(jit_max_val, max_jitter))
-    final_img.paste(resized_img, (x_off, 0))
-
-    img_np = np.array(final_img).astype(np.float32) / 255.0
-    img_tensor = np.transpose(img_np, (2, 0, 1))
-    return img_tensor, text
+    return bg, txt
 
 
-def ctc_decode(logits, idx_to_char_map=None):
-    """CTC greedy decoder. Uses global idx_to_char by default."""
-    _map = idx_to_char_map if idx_to_char_map is not None else globals().get("idx_to_char", {})
-    if not _map:
-        return ""
-    pred = logits.argmax(-1)
-    text = []
-    prev = -1
-    for p in pred:
-        p = p.item()
-        if p != prev and p != 0:
-            if p in _map:
-                text.append(_map[p])
-        prev = p
-    return "".join(text)
+def ctc_decode(logits, idx_to_char):
+    """Decode logits using CTC greedy decoding.
+
+    Args:
+        logits: (seq_len, num_classes) or (num_classes, seq_len) tensor
+        idx_to_char: dict mapping class index → character
+
+    Returns:
+        decoded string
+    """
+    if logits.dim() == 2:
+        # (seq_len, num_classes)
+        pred_indices = torch.argmax(logits, dim=1).cpu().numpy()
+    else:
+        # (num_classes, seq_len)
+        pred_indices = torch.argmax(logits, dim=0).cpu().numpy()
+
+    pred_text = []
+    prev_idx = None
+    for idx in pred_indices:
+        if idx != prev_idx and idx != 0:  # Skip repeated and blank tokens
+            if idx in idx_to_char:
+                pred_text.append(idx_to_char[idx])
+        prev_idx = idx
+    return "".join(pred_text)
 
 
 def levenshtein_distance(s1, s2):
-    """Compute Levenshtein (edit) distance between two strings."""
-    if len(s1) > len(s2):
-        s1, s2 = s2, s1
-    distances = range(len(s1) + 1)
-    for i2, c2 in enumerate(s2):
-        distances_ = [i2 + 1]
-        for i1, c1 in enumerate(s1):
-            if c1 == c2:
-                distances_.append(distances[i1])
-            else:
-                distances_.append(1 + min((distances[i1], distances[i1 + 1], distances_[-1])))
-        distances = distances_
-    return distances[-1]
+    """Compute the Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+
+    if len(s2) == 0:
+        return len(s1)
+
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    return previous_row[-1]
+
+
+def collate_fn(batch, char_to_idx, charset):
+    """Collate function that encodes text labels and returns padded targets.
+
+    Args:
+        batch: list of (image, label) tuples
+        char_to_idx: dict mapping char → class index
+        charset: string of valid characters
+
+    Returns:
+        images: (B, C, H, W) tensor
+        targets: concatenated encoded targets
+        target_lengths: (B,) tensor of per-sample target lengths
+        texts: original text labels
+    """
+    import warnings
+
+    images, texts = zip(*batch)
+    images = torch.stack(images)
+
+    targets = []
+    target_lengths = []
+
+    for text in texts:
+        encoded = [char_to_idx[c] for c in text if c in charset]
+        if not encoded:
+            warnings.warn(
+                f"All characters in label '{text}' were dropped. "
+                "Check that the config charset matches the dataset labels."
+            )
+        targets.extend(encoded)
+        target_lengths.append(len(encoded))
+
+    targets = torch.tensor(targets, dtype=torch.long)
+    target_lengths = torch.tensor(target_lengths, dtype=torch.long)
+
+    return images, targets, target_lengths, texts

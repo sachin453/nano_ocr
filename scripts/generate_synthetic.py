@@ -1,8 +1,8 @@
-"""Generate a pre-built synthetic OCR dataset with augmentations.
+"""Generate a pre-built synthetic OCR dataset with augmentations (multiprocessing).
 
 Usage:
-    python scripts/generate_synthetic.py --config ocr --count 100000 --output data/synthetic
-    python scripts/generate_synthetic.py --config ocr  # defaults to 1M, data/synthetic
+    python scripts/generate_synthetic.py --config ocr_mobilenetv3 --count 100000 --output data/synthetic
+    python scripts/generate_synthetic.py --config ocr_mobilenetv3 --count 50000 --workers 8
 """
 
 import argparse
@@ -10,6 +10,7 @@ import json
 import os
 import random
 import shutil
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import cv2
@@ -26,6 +27,26 @@ from ultraocr.utils import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Worker state (initialized per-process)
+# ---------------------------------------------------------------------------
+
+_WORKER_CFG = None
+_WORKER_IMAGES_DIR = None
+
+
+def _worker_init(config_name, images_dir):
+    """Initialize worker process: load config, discover fonts, set globals."""
+    global _WORKER_CFG, _WORKER_IMAGES_DIR
+    _WORKER_CFG = Config(f"config/{config_name}.yaml")
+    _WORKER_IMAGES_DIR = images_dir
+    _init_from_config(_WORKER_CFG)
+
+
+# ---------------------------------------------------------------------------
+# Augmentations
+# ---------------------------------------------------------------------------
+
 def apply_augmentations(img):
     """Apply random distortions to a uint8 HxWxC image. Returns augmented image."""
     img = img.copy()
@@ -33,11 +54,9 @@ def apply_augmentations(img):
     # --- Noise ---
     if random.random() < 0.4:
         if random.random() < 0.5:
-            # Gaussian noise
             noise = np.random.randn(*img.shape) * random.randint(3, 12)
             img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         else:
-            # Salt & pepper
             prob = random.uniform(0.001, 0.01)
             mask = np.random.random(img.shape[:2]) < prob
             img[mask] = random.randint(0, 255)
@@ -48,7 +67,6 @@ def apply_augmentations(img):
         if random.random() < 0.6:
             img = cv2.GaussianBlur(img, (ksize, ksize), 0)
         else:
-            # Motion blur kernel
             kernel = np.zeros((ksize, ksize))
             kernel[int((ksize - 1) / 2), :] = np.ones(ksize)
             kernel = kernel / ksize
@@ -56,8 +74,8 @@ def apply_augmentations(img):
 
     # --- Brightness / Contrast ---
     if random.random() < 0.5:
-        alpha = random.uniform(0.7, 1.3)  # contrast
-        beta = random.randint(-20, 20)     # brightness
+        alpha = random.uniform(0.7, 1.3)
+        beta = random.randint(-20, 20)
         img = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
 
     # --- Slight rotation (±3°) ---
@@ -81,28 +99,102 @@ def apply_augmentations(img):
         M = cv2.getPerspectiveTransform(src, dst)
         img = cv2.warpPerspective(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
 
+    # --- JPEG compression artifacts (simulates screenshot compression) ---
+    if random.random() < 0.4:
+        quality = random.randint(30, 85)
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        _, encoded = cv2.imencode(".jpg", img, encode_param)
+        img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+    # --- Scaling artifacts (downscale → upscale, simulates resolution mismatch) ---
+    if random.random() < 0.3:
+        h, w = img.shape[:2]
+        scale = random.uniform(0.5, 0.85)
+        small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+        img = cv2.resize(small, (w, h), interpolation=random.choice([
+            cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_NEAREST
+        ]))
+
+    # --- Gamma correction (display calibration differences) ---
+    if random.random() < 0.3:
+        gamma = random.uniform(0.6, 1.8)
+        inv_gamma = 1.0 / gamma
+        table = np.array([((i / 255.0) ** inv_gamma) * 255
+                          for i in np.arange(256)]).astype(np.uint8)
+        img = cv2.LUT(img, table)
+
+    # --- Hue/Saturation shift (color profile differences) ---
+    if random.random() < 0.3:
+        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[:, :, 0] = (hsv[:, :, 0] + random.randint(-15, 15)) % 180
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.7, 1.3), 0, 255)
+        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    # --- Channel permutation (RGB/BGR rendering differences) ---
+    if random.random() < 0.15:
+        perm = random.choice([(0, 1, 2), (2, 0, 1), (1, 2, 0), (2, 1, 0)])
+        img = img[:, :, list(perm)]
+
+    # --- Elastic distortion (subtle warping) ---
+    if random.random() < 0.2:
+        img = _elastic_distortion(img, alpha=random.uniform(2, 6),
+                                  sigma=random.uniform(0.5, 1.5))
+
     return img
 
 
-def generate_one(cfg):
-    """Generate one synthetic image tensor + label, with config support."""
-    if cfg is not None:
-        _init_from_config(cfg)
-        synth_cfg = cfg.dataset.synthetic
-    else:
-        synth_cfg = None
+def _elastic_distortion(img, alpha=4, sigma=1.0):
+    """Apply elastic distortion to simulate subtle display warping."""
+    h, w = img.shape[:2]
+    dx = cv2.GaussianBlur(np.random.uniform(-1, 1, (h, w)).astype(np.float32),
+                          (0, 0), sigma) * alpha
+    dy = cv2.GaussianBlur(np.random.uniform(-1, 1, (h, w)).astype(np.float32),
+                          (0, 0), sigma) * alpha
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+    return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REPLICATE)
 
-    if not FONT_PATHS:
-        for d in ("data/fonts_simple", "data/fonts_heavy"):
-            for ext in ("*.ttf", "*.otf", "*.TTF", "*.OTF"):
-                FONT_PATHS.extend(str(p) for p in Path(d).rglob(ext))
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+def _make_gradient_bg(w, h, base_color):
+    """Create a subtle gradient background (common in UI panels)."""
+    bg = np.zeros((h, w, 3), dtype=np.uint8)
+    direction = random.choice(["horizontal", "vertical", "diagonal"])
+    c = np.array(base_color, dtype=np.float32)
+
+    if direction == "horizontal":
+        for x in range(w):
+            factor = 1.0 + (x / w - 0.5) * random.uniform(0.05, 0.15)
+            bg[:, x] = np.clip(c * factor, 0, 255)
+    elif direction == "vertical":
+        for y in range(h):
+            factor = 1.0 + (y / h - 0.5) * random.uniform(0.05, 0.15)
+            bg[y, :] = np.clip(c * factor, 0, 255)
+    else:  # diagonal
+        for y in range(h):
+            for x in range(w):
+                factor = 1.0 + ((x / w + y / h) / 2 - 0.5) * random.uniform(0.05, 0.12)
+                bg[y, x] = np.clip(c * factor, 0, 255)
+
+    return bg
+
+
+def _generate_one(cfg):
+    """Generate one synthetic image (numpy HxWx3 RGB) + label string."""
+    synth_cfg = getattr(cfg.dataset, "synthetic", None)
 
     tl_min, tl_max = (synth_cfg.text_length[0], synth_cfg.text_length[1]) if synth_cfg else (3, 12)
     fs_min, fs_max = (synth_cfg.font_size[0], synth_cfg.font_size[1]) if synth_cfg else (32, 48)
     pad_min, pad_max = (synth_cfg.pad[0], synth_cfg.pad[1]) if synth_cfg else (0, 3)
     jit_max_val = synth_cfg.jitter[1] if synth_cfg else 10
 
-    chars = cfg.charset if cfg else "0123456789"
+    chars = cfg.charset
     length = random.randint(tl_min, tl_max)
     text = "".join(random.choice(chars) for _ in range(length))
     bg_color, txt_color = get_random_colors()
@@ -122,15 +214,44 @@ def generate_one(cfg):
     crop_w = max(1, tw + pad_x * 2)
     crop_h = max(1, th + pad_y * 2)
 
-    tight_img = Image.new("RGB", (crop_w, crop_h), color=bg_color)
-    draw = ImageDraw.Draw(tight_img)
-    draw.text((pad_x - bbox[0], pad_y - bbox[1]), text, font=font, fill=txt_color)
+    # --- Background: solid or gradient ---
+    use_gradient = random.random() < 0.3
+    if use_gradient:
+        bg_array = _make_gradient_bg(crop_w, crop_h, bg_color)
+        tight_img = Image.fromarray(bg_array)
+    else:
+        tight_img = Image.new("RGB", (crop_w, crop_h), color=bg_color)
 
+    draw = ImageDraw.Draw(tight_img)
+
+    # --- Text shadow (common in UI) ---
+    if random.random() < 0.25:
+        shadow_offset = random.randint(1, 2)
+        shadow_color = tuple(max(0, c - 40) for c in bg_color)
+        draw.text((pad_x - bbox[0] + shadow_offset, pad_y - bbox[1] + shadow_offset),
+                  text, font=font, fill=shadow_color)
+
+    # --- Text outline/stroke (common in UI) ---
+    stroke_width = 0
+    if random.random() < 0.15:
+        stroke_width = 1
+
+    draw.text((pad_x - bbox[0], pad_y - bbox[1]), text, font=font,
+              fill=txt_color, stroke_width=stroke_width,
+              stroke_fill=tuple(max(0, c - 60) for c in txt_color))
+
+    # --- Resize to target height ---
     scale = IMG_H / crop_h
     new_w = min(int(crop_w * scale), IMG_W)
     resized = tight_img.resize((new_w, IMG_H), Image.Resampling.BILINEAR)
 
-    final_img = Image.new("RGB", (IMG_W, IMG_H), color=bg_color)
+    # --- Place on canvas ---
+    if use_gradient:
+        final_bg = _make_gradient_bg(IMG_W, IMG_H, bg_color)
+        final_img = Image.fromarray(final_bg)
+    else:
+        final_img = Image.new("RGB", (IMG_W, IMG_H), color=bg_color)
+
     max_jitter = max(0, IMG_W - new_w)
     x_off = random.randint(0, min(jit_max_val, max_jitter))
     final_img.paste(resized, (x_off, 0))
@@ -138,69 +259,86 @@ def generate_one(cfg):
     return np.array(final_img), text
 
 
-def main(config_name, count, output_dir):
+def _generate_and_save(idx):
+    """Worker function: generate one image, augment, save to disk, return label dict.
+
+    Uses module-level _WORKER_CFG and _WORKER_IMAGES_DIR set by _worker_init.
+    """
+    img_np, text = _generate_one(_WORKER_CFG)
+    img_aug = apply_augmentations(img_np)
+
+    filename = f"{idx:08d}.png"
+    filepath = os.path.join(_WORKER_IMAGES_DIR, filename)
+    cv2.imwrite(filepath, cv2.cvtColor(img_aug, cv2.COLOR_RGB2BGR))
+
+    return {"path": os.path.abspath(filepath), "label": text}
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(config_name, count, output_dir, workers):
     cfg = Config(f"config/{config_name}.yaml")
     _init_from_config(cfg)
 
-    # Remove existing output directory to avoid mixing old/new data
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     images_dir = os.path.join(output_dir, "images")
     os.makedirs(images_dir, exist_ok=True)
 
-    labels = []
-
     print(f"Generating {count} images → {output_dir}")
     print(f"Charset: {cfg.charset} ({cfg.num_chars} chars)")
     print(f"Image size: {IMG_W}x{IMG_H}")
     print(f"Fonts: {len(FONT_PATHS)} available")
+    print(f"Workers: {workers}")
 
-    for i in tqdm(range(count), desc="Generating"):
-        img_pil, text = generate_one(cfg)
+    labels = [None] * count  # pre-allocate for ordered results
 
-        # Apply augmentations (PIL → numpy uint8 → augment → save)
-        img_np = np.array(img_pil)
-        img_aug = apply_augmentations(img_np)
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_worker_init,
+        initargs=(config_name, images_dir),
+    ) as executor:
+        futures = {
+            executor.submit(_generate_and_save, i): i
+            for i in range(count)
+        }
 
-        filename = f"{i:08d}.png"
-        filepath = os.path.join(images_dir, filename)
-        cv2.imwrite(filepath, cv2.cvtColor(img_aug, cv2.COLOR_RGB2BGR))
+        for future in tqdm(
+            as_completed(futures), total=count, desc="Generating"
+        ):
+            idx = futures[future]
+            labels[idx] = future.result()
 
-        labels.append({"path": os.path.abspath(filepath), "label": text})
-
-    # Write labels.json
     json_path = os.path.join(output_dir, "labels.json")
     with open(json_path, "w") as f:
         json.dump(labels, f, indent=2)
 
     print(f"\nDone. {count} images saved to {images_dir}")
     print(f"Labels index: {json_path}")
-    print(f"Config to use:  dataset.data_json: \"{json_path}\"")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate a pre-built synthetic OCR dataset",
+        description="Generate a pre-built synthetic OCR dataset (multiprocessing)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--config",
-        type=str,
-        default="ocr",
-        help="Config name (without .yaml extension, looked up in config/ dir)",
+        "--config", type=str, default="ocr_mobilenetv3",
+        help="Config name (without .yaml extension)",
     )
     parser.add_argument(
-        "--count",
-        type=int,
-        default=1_000_000,
+        "--count", type=int, default=1_000_000,
         help="Number of images to generate",
     )
     parser.add_argument(
-        "--output",
-        type=str,
-        default="data/synthetic",
-        help="Output directory (will contain images/ and labels.json)",
+        "--output", type=str, default="data/synthetic",
+        help="Output directory",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=os.cpu_count(),
+        help="Number of parallel worker processes",
     )
     args = parser.parse_args()
-
-    main(args.config, args.count, args.output)
+    main(args.config, args.count, args.output, args.workers)

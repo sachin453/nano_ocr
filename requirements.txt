@@ -1,5 +1,7 @@
 torch
 torchvision
+timm
+torchinfo
 numpy
 opencv-python
 pillow

@@ -1,4 +1,4 @@
-"""Evaluate UltraOCR:  python scripts/eval.py --config ocr"""
+"""Evaluate UltraOCR:  python scripts/eval.py --config ocr_mobilenetv3"""
 
 import argparse
 import torch
@@ -6,53 +6,51 @@ from torch.utils.data import DataLoader
 
 from ultraocr.config import Config
 from ultraocr.model import OCR
-from ultraocr.dataset import OCRDataset, collate_fn
-from ultraocr.utils import (
-    ctc_decode,
-    generate_simple_synthetic,
-    levenshtein_distance,
-    _init_from_config,
-)
+from ultraocr.dataset import OCRDataset
+from ultraocr.utils import ctc_decode, levenshtein_distance, collate_fn
 
 
 def main(config_name, checkpoint_path=None, num_samples=10):
-    cfg = Config(f"config/{config_name}.yaml")
-    _init_from_config(cfg)
-
-    checkpoint_path = checkpoint_path or cfg.checkpoint.best_path
+    config_path = f"config/{config_name}.yaml"
+    cfg = Config(config_path)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    checkpoint_path = checkpoint_path or cfg.best_path
     print(f"Config: {config_name}  |  Device: {device}  |  Checkpoint: {checkpoint_path}")
 
-    # --- Model (architecture is defined in model.py, not in config) ---
-    model = OCR(num_of_chars=cfg.num_chars).to(device)
+    # --- Model ---
+    model = OCR(cfg).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     print("Checkpoint loaded.\n")
 
-    # --- Synthetic samples ---
+    # --- Synthetic samples (random noise for quick sanity check) ---
     print("--- Synthetic Samples ---")
     for _ in range(num_samples):
-        img, gt = generate_simple_synthetic(cfg)
-        x = torch.tensor(img).float().unsqueeze(0).to(device)
+        img = torch.randn(3, cfg.model.img_h, cfg.model.img_w, dtype=torch.float32)
+        x = img.unsqueeze(0).to(device)
         with torch.no_grad():
             logits = model(x)[0]
         pred = ctc_decode(logits, cfg.idx_to_char)
-        print(f"  GT: {gt:12s}  PRED: {pred}")
+        print(f"  PRED: {pred}")
 
     # --- Validation set ---
-    print("\n--- Validation Set ---")
-    val_dataset = OCRDataset(cfg.dataset.val_json, shuffle=False, num_samples=cfg.dataset.get("num_samples"))
+    from functools import partial
+    val_collate = partial(collate_fn, char_to_idx=cfg.char_to_idx, charset=cfg.charset)
+
+    val_dataset = OCRDataset(
+        cfg.dataset.json_path,
+        shuffle=False,
+        num_samples=cfg.dataset.num_samples,
+    )
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.dataset.batch_size,
         shuffle=False,
         num_workers=cfg.dataset.num_workers,
-        collate_fn=collate_fn,
-        prefetch_factor=cfg.dataset.prefetch_factor,
-        persistent_workers=True,
+        collate_fn=val_collate,
     )
 
     total_edit_distance = 0
@@ -70,7 +68,7 @@ def main(config_name, checkpoint_path=None, num_samples=10):
                 total_gt_chars += max(len(gt_text), 1)
 
     char_accuracy = (1.0 - (total_edit_distance / total_gt_chars)) * 100
-    print(f"Character Accuracy: {char_accuracy:.2f}%")
+    print(f"\nCharacter Accuracy: {char_accuracy:.2f}%")
 
 
 if __name__ == "__main__":
@@ -81,7 +79,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         type=str,
-        default="ocr",
+        default="ocr_mobilenetv3",
         help="Config name (without .yaml extension, looked up in config/ dir)",
     )
     parser.add_argument(
