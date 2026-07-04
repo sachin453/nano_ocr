@@ -14,6 +14,7 @@ build/
 
 # Data directories
 data/
+paddle_ocr_weights/
 
 # Environment
 venv/
