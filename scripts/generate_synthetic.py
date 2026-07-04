@@ -10,7 +10,7 @@ import json
 import os
 import random
 import shutil
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -47,100 +47,128 @@ def _worker_init(config_name, images_dir):
 # Augmentations
 # ---------------------------------------------------------------------------
 
+def _aug_noise(img):
+    """Gaussian or salt-and-pepper noise."""
+    if random.random() < 0.5:
+        noise = np.random.randn(*img.shape) * random.randint(3, 12)
+        img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+    else:
+        prob = random.uniform(0.001, 0.01)
+        mask = np.random.random(img.shape[:2]) < prob
+        img[mask] = random.randint(0, 255)
+    return img
+
+
+def _aug_blur(img):
+    """Gaussian or motion blur."""
+    ksize = random.choice([3, 5])
+    if random.random() < 0.6:
+        return cv2.GaussianBlur(img, (ksize, ksize), 0)
+    kernel = np.zeros((ksize, ksize))
+    kernel[int((ksize - 1) / 2), :] = np.ones(ksize)
+    kernel = kernel / ksize
+    return cv2.filter2D(img, -1, kernel)
+
+
+def _aug_brightness(img):
+    """Brightness / contrast shift."""
+    alpha = random.uniform(0.7, 1.3)
+    beta = random.randint(-20, 20)
+    return np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
+
+
+def _aug_rotation(img):
+    """Slight rotation (±3°)."""
+    angle = random.uniform(-3, 3)
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+
+def _aug_perspective(img):
+    """Perspective skew."""
+    h, w = img.shape[:2]
+    jitter = random.randint(1, 4)
+    src = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+    dst = np.float32([
+        [random.randint(0, jitter), random.randint(0, jitter)],
+        [w - random.randint(0, jitter), random.randint(0, jitter)],
+        [random.randint(0, jitter), h - random.randint(0, jitter)],
+        [w - random.randint(0, jitter), h - random.randint(0, jitter)],
+    ])
+    M = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
+
+
+def _aug_jpeg(img):
+    """JPEG compression artifacts (simulates screenshot compression)."""
+    quality = random.randint(30, 85)
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    _, encoded = cv2.imencode(".jpg", img, encode_param)
+    return cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+
+
+def _aug_scaling(img):
+    """Scaling artifacts (downscale → upscale, simulates resolution mismatch)."""
+    h, w = img.shape[:2]
+    scale = random.uniform(0.5, 0.85)
+    small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                       interpolation=cv2.INTER_AREA)
+    return cv2.resize(small, (w, h), interpolation=random.choice([
+        cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_NEAREST
+    ]))
+
+
+def _aug_gamma(img):
+    """Gamma correction (display calibration differences)."""
+    gamma = random.uniform(0.6, 1.8)
+    inv_gamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** inv_gamma) * 255
+                      for i in np.arange(256)]).astype(np.uint8)
+    return cv2.LUT(img, table)
+
+
+def _aug_hue(img):
+    """Hue/Saturation shift (color profile differences)."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[:, :, 0] = (hsv[:, :, 0] + random.randint(-15, 15)) % 180
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.7, 1.3), 0, 255)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+
+def _aug_channel_swap(img):
+    """Channel permutation (RGB/BGR rendering differences)."""
+    perm = random.choice([(0, 1, 2), (2, 0, 1), (1, 2, 0), (2, 1, 0)])
+    return img[:, :, list(perm)]
+
+
+def _aug_elastic(img):
+    """Elastic distortion (subtle warping)."""
+    return _elastic_distortion(img, alpha=random.uniform(2, 6),
+                               sigma=random.uniform(0.5, 1.5))
+
+
+# All available augmentations
+_AUGMENTATIONS = [
+    _aug_noise, _aug_blur, _aug_brightness, _aug_rotation,
+    _aug_perspective, _aug_jpeg, _aug_scaling, _aug_gamma,
+    _aug_hue, _aug_channel_swap, _aug_elastic,
+]
+
+MAX_AUGMENTATIONS = 3
+
+
 def apply_augmentations(img):
-    """Apply random distortions to a uint8 HxWxC image. Returns augmented image."""
+    """Apply up to MAX_AUGMENTATIONS random distortions to a uint8 HxWxC image.
+
+    Instead of rolling each augmentation independently (which could stack 5-6
+    at once and destroy legibility), we pick a random subset of at most 3.
+    """
     img = img.copy()
-
-    # --- Noise ---
-    if random.random() < 0.4:
-        if random.random() < 0.5:
-            noise = np.random.randn(*img.shape) * random.randint(3, 12)
-            img = np.clip(img.astype(np.float32) + noise, 0, 255).astype(np.uint8)
-        else:
-            prob = random.uniform(0.001, 0.01)
-            mask = np.random.random(img.shape[:2]) < prob
-            img[mask] = random.randint(0, 255)
-
-    # --- Blur ---
-    if random.random() < 0.3:
-        ksize = random.choice([3, 5])
-        if random.random() < 0.6:
-            img = cv2.GaussianBlur(img, (ksize, ksize), 0)
-        else:
-            kernel = np.zeros((ksize, ksize))
-            kernel[int((ksize - 1) / 2), :] = np.ones(ksize)
-            kernel = kernel / ksize
-            img = cv2.filter2D(img, -1, kernel)
-
-    # --- Brightness / Contrast ---
-    if random.random() < 0.5:
-        alpha = random.uniform(0.7, 1.3)
-        beta = random.randint(-20, 20)
-        img = np.clip(alpha * img.astype(np.float32) + beta, 0, 255).astype(np.uint8)
-
-    # --- Slight rotation (±3°) ---
-    if random.random() < 0.5:
-        angle = random.uniform(-3, 3)
-        h, w = img.shape[:2]
-        M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-        img = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-
-    # --- Perspective skew ---
-    if random.random() < 0.3:
-        h, w = img.shape[:2]
-        jitter = random.randint(1, 4)
-        src = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
-        dst = np.float32([
-            [random.randint(0, jitter), random.randint(0, jitter)],
-            [w - random.randint(0, jitter), random.randint(0, jitter)],
-            [random.randint(0, jitter), h - random.randint(0, jitter)],
-            [w - random.randint(0, jitter), h - random.randint(0, jitter)],
-        ])
-        M = cv2.getPerspectiveTransform(src, dst)
-        img = cv2.warpPerspective(img, M, (w, h), borderMode=cv2.BORDER_REPLICATE)
-
-    # --- JPEG compression artifacts (simulates screenshot compression) ---
-    if random.random() < 0.4:
-        quality = random.randint(30, 85)
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
-        _, encoded = cv2.imencode(".jpg", img, encode_param)
-        img = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-
-    # --- Scaling artifacts (downscale → upscale, simulates resolution mismatch) ---
-    if random.random() < 0.3:
-        h, w = img.shape[:2]
-        scale = random.uniform(0.5, 0.85)
-        small = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
-                           interpolation=cv2.INTER_AREA)
-        img = cv2.resize(small, (w, h), interpolation=random.choice([
-            cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_NEAREST
-        ]))
-
-    # --- Gamma correction (display calibration differences) ---
-    if random.random() < 0.3:
-        gamma = random.uniform(0.6, 1.8)
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255
-                          for i in np.arange(256)]).astype(np.uint8)
-        img = cv2.LUT(img, table)
-
-    # --- Hue/Saturation shift (color profile differences) ---
-    if random.random() < 0.3:
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
-        hsv[:, :, 0] = (hsv[:, :, 0] + random.randint(-15, 15)) % 180
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * random.uniform(0.7, 1.3), 0, 255)
-        img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-    # --- Channel permutation (RGB/BGR rendering differences) ---
-    if random.random() < 0.15:
-        perm = random.choice([(0, 1, 2), (2, 0, 1), (1, 2, 0), (2, 1, 0)])
-        img = img[:, :, list(perm)]
-
-    # --- Elastic distortion (subtle warping) ---
-    if random.random() < 0.2:
-        img = _elastic_distortion(img, alpha=random.uniform(2, 6),
-                                  sigma=random.uniform(0.5, 1.5))
-
+    n = random.randint(0, MAX_AUGMENTATIONS)
+    chosen = random.sample(_AUGMENTATIONS, n)
+    for aug in chosen:
+        img = aug(img)
     return img
 
 
@@ -293,23 +321,18 @@ def main(config_name, count, output_dir, workers):
     print(f"Fonts: {len(FONT_PATHS)} available")
     print(f"Workers: {workers}")
 
-    labels = [None] * count  # pre-allocate for ordered results
-
     with ProcessPoolExecutor(
         max_workers=workers,
         initializer=_worker_init,
         initargs=(config_name, images_dir),
     ) as executor:
-        futures = {
-            executor.submit(_generate_and_save, i): i
-            for i in range(count)
-        }
-
-        for future in tqdm(
-            as_completed(futures), total=count, desc="Generating"
-        ):
-            idx = futures[future]
-            labels[idx] = future.result()
+        # Use map with chunksize for efficient lazy submission
+        # (avoids creating 500K futures upfront which hangs on large counts)
+        chunksize = max(1, count // (workers * 50))
+        results = executor.map(
+            _generate_and_save, range(count), chunksize=chunksize
+        )
+        labels = list(tqdm(results, total=count, desc="Generating"))
 
     json_path = os.path.join(output_dir, "labels.json")
     with open(json_path, "w") as f:

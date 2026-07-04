@@ -15,8 +15,8 @@ blank_token: 0
 
 dataset:
   json_path: "data/synthetic/labels.json"
-  num_samples: 100000
-  train_split: 0.9
+  num_samples: 200000
+  train_split: 0.85
   batch_size: 512
   num_workers: 10
   shuffle: true
@@ -29,8 +29,8 @@ dataset:
 training:
   lr: 0.001
   weight_decay: 0.00001
-  epochs: 20
-  early_stopping_patience: 5
+  epochs: 50
+  early_stopping_patience: 50
 
 checkpoint:
   dir: "artifacts"
